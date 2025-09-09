@@ -65,6 +65,11 @@ static func load_web_font(font_info: Dictionary) -> void:
 	
 	http_request.request(src, headers)
 
+static func clear_fonts() -> void:
+	loaded_fonts.clear()
+	font_requests.clear()
+	refresh_callback = Callable()
+
 static func get_font(family_name: String) -> Font:
 	if family_name == "sans-serif":
 		var sys_font = SystemFont.new()
@@ -85,10 +90,6 @@ static func get_font(family_name: String) -> Font:
 		var sys_font = SystemFont.new()
 		sys_font.font_names = [family_name]
 		return sys_font
-
-static func clear_fonts() -> void:
-	loaded_fonts.clear()
-	font_requests.clear()
 
 static func set_refresh_callback(callback: Callable) -> void:
 	refresh_callback = callback

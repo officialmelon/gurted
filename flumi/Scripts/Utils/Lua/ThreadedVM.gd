@@ -55,6 +55,20 @@ func stop_lua_thread():
 	
 	lua_thread.wait_to_finish()
 	lua_thread = null
+	
+	# Clean up VM and other resources
+	if lua_vm:
+		lua_vm = null
+	
+	# Clear command queue
+	queue_mutex.lock()
+	command_queue.clear()
+	queue_mutex.unlock()
+	
+	# Reset state
+	should_exit = false
+	dom_parser = null
+	lua_api = null
 
 func execute_script_async(script_code: String):
 	queue_mutex.lock()

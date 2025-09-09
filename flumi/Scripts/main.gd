@@ -46,6 +46,18 @@ var network_start_time: float = 0.0
 var network_end_time: float = 0.0
 var download_manager: DownloadManager = null
 
+# Performance optimization: Resource pools
+var lua_api_pool: Array[LuaAPI] = []
+var max_pool_size: int = 3
+
+# Memory monitoring
+var memory_check_timer: Timer
+var last_memory_check: float = 0.0
+
+# Rendering performance settings
+var max_elements_per_frame: int = 5
+var max_children_per_yield: int = 10
+
 func should_group_as_inline(element: HTMLParser.HTMLElement) -> bool:
 	if element.tag_name == "input":
 		var parent = element.parent
@@ -74,6 +86,7 @@ func _ready():
 	call_deferred("render")
 	call_deferred("update_navigation_buttons")
 	call_deferred("_handle_startup_behavior")
+	call_deferred("_setup_memory_monitoring")
 
 func _input(_event: InputEvent) -> void:
 	if Input.is_action_just_pressed("DevTools"):
@@ -142,7 +155,15 @@ func fetch_gurt_content_async(gurt_url: String, tab: Tab, original_url: String, 
 	
 	thread.start(_perform_gurt_request_threaded.bind(request_data))
 	
+	# Use a more efficient waiting mechanism
+	var timeout_start = Time.get_ticks_msec()
 	while thread.is_alive():
+		# Check for timeout to prevent hanging
+		if Time.get_ticks_msec() - timeout_start > 30000: # 30 second timeout
+			print("Request timeout for: ", gurt_url)
+			thread.wait_to_finish()
+			_handle_gurt_result({"success": false, "error": "Request timeout"}, tab, original_url, gurt_url, add_to_history)
+			return
 		await get_tree().process_frame
 	
 	var result = thread.wait_to_finish()
@@ -196,8 +217,12 @@ func fetch_local_file_content_async(file_url: String, tab: Tab, original_url: St
 		if FileUtils.is_html_file(file_path):
 			handle_local_file_result({"success": true, "html_bytes": result.content}, tab, original_url, file_url, add_to_history)
 		else:
-			var content_str = result.content.get_string_from_utf8()
-			var wrapped_html = """<head>
+			# Check if file is binary before attempting UTF-8 conversion
+			if _is_binary_file(result.content):
+				handle_binary_file(file_path, result.content, tab, original_url, file_url, add_to_history)
+			else:
+				var content_str = result.content.get_string_from_utf8()
+				var wrapped_html = """<head>
 	<title>""" + file_path.get_file() + """</title>
 	<style>
 		body { bg-[#ffffff] text-[#202124] font-mono p-6 m-0 }
@@ -210,7 +235,7 @@ func fetch_local_file_content_async(file_url: String, tab: Tab, original_url: St
 		<pre>""" + content_str.xml_escape() + """</pre>
 	</div>
 </body>"""
-			handle_local_file_result({"success": true, "html_bytes": wrapped_html.to_utf8_buffer()}, tab, original_url, file_url, add_to_history)
+				handle_local_file_result({"success": true, "html_bytes": wrapped_html.to_utf8_buffer()}, tab, original_url, file_url, add_to_history)
 	else:
 		handle_local_file_error(result.error, tab)
 
@@ -299,10 +324,19 @@ func render() -> void:
 	render_content(Constants.HTML_CONTENT)
 
 func render_content(html_bytes: PackedByteArray) -> void:
+	# Start progressive rendering to prevent freezing
+	await _render_content_progressive(html_bytes)
+
+func _render_content_progressive(html_bytes: PackedByteArray) -> void:
+	# Only clear requests if we're not in a multi-tab scenario
+	# This prevents clearing requests from other tabs
 	if main_navigation_request:
 		NetworkManager.clear_all_requests_except(main_navigation_request.id)
 	else:
-		NetworkManager.clear_all_requests()
+		# Only clear requests if we're not in a tab context
+		var active_tab = get_active_tab()
+		if not active_tab:
+			NetworkManager.clear_all_requests()
 	
 	var active_tab = get_active_tab()
 	var target_container: Control
@@ -316,13 +350,142 @@ func render_content(html_bytes: PackedByteArray) -> void:
 		print("Error: No container available for rendering")
 		return
 	
+	# Show loading indicator
+	if active_tab:
+		active_tab.start_loading()
+	
+	# Clean up existing content (yield after cleanup)
+	await _cleanup_existing_content(active_tab, target_container)
+	
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	# Initialize font system
+	font_dependent_elements.clear()
+	FontManager.clear_fonts()
+	FontManager.set_refresh_callback(refresh_fonts)
+	
+	# Parse HTML (yield after parsing)
+	var parser: HTMLParser = HTMLParser.new(html_bytes)
+	var parse_result = parser.parse()
+	
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	# Process styles (yield after processing)
+	parser.process_styles()
+	
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	# Process external CSS (already async)
+	if parse_result.external_css and not parse_result.external_css.is_empty():
+		await parser.process_external_styles(current_domain)
+	
+	# Process and load fonts (yield after processing)
+	parser.process_fonts()
+	FontManager.load_all_fonts()
+	
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	if parse_result.errors.size() > 0:
+		print("Parse errors: " + str(parse_result.errors))
+	
+	var tab = active_tab
+	
+	# Set tab metadata
+	var title = parser.get_title()
+	tab.set_title(title)
+	
+	var icon = parser.get_icon()
+	tab.update_icon_from_url(icon)
+	
+	if not icon.is_empty():
+		tab.set_meta("parsed_icon_url", icon)
+	
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	# Process body and styles
+	var body = parser.find_first("body")
+	
+	if body:
+		var background_panel = active_tab.background_panel
+		
+		StyleManager.apply_body_styles(body, parser, target_container, background_panel)
+		
+		parser.register_dom_node(body, target_container)
+	
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	# Setup Lua API
+	var scripts = parser.find_all("script")
+	
+	var lua_api = get_lua_api_from_pool()
+	add_child(lua_api)
+	if active_tab:
+		active_tab.lua_apis.append(lua_api)
+	
+	lua_api.dom_parser = parser
+	
+	if lua_api.threaded_vm:
+		lua_api.threaded_vm.dom_parser = parser
+
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	# Render elements progressively
+	if body:
+		await _render_elements_progressively(body, parser, target_container)
+	
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	# Process scripts
+	if scripts.size() > 0 and lua_api:
+		parser.process_scripts(lua_api, null)
+		if parse_result.external_scripts and not parse_result.external_scripts.is_empty():
+			# Extract base URL without query parameters for script resolution
+			var base_url_for_scripts = current_domain
+			var query_pos = base_url_for_scripts.find("?")
+			if query_pos != -1:
+				base_url_for_scripts = base_url_for_scripts.substr(0, query_pos)
+			await parser.process_external_scripts(lua_api, null, base_url_for_scripts)
+	
+	# Yield to prevent blocking
+	await get_tree().process_frame
+	
+	# Process postprocess effects
+	var postprocess_element = parser.process_postprocess()
+	if postprocess_element:
+		var postprocess_node = POSTPROCESS.instantiate()
+		add_child(postprocess_node)
+		await postprocess_node.init(postprocess_element, parser)
+	
+	# Finalize
+	active_tab.current_url = current_domain
+	active_tab.has_content = true
+	
+	# Stop loading indicator
+	if active_tab:
+		active_tab.stop_loading()
+	
+	print("Rendering completed successfully!")
+
+func _cleanup_existing_content(active_tab: Tab, target_container: Control) -> void:
 	if active_tab:
 		var existing_tab_lua_apis = active_tab.lua_apis
 		for lua_api in existing_tab_lua_apis:
 			if is_instance_valid(lua_api):
-				lua_api.kill_script_execution()
+				# Clean up any remaining child timers
+				for child in lua_api.get_children():
+					if child is Timer:
+						child.stop()
+						child.queue_free()
 				remove_child(lua_api)
-				lua_api.queue_free()
+				return_lua_api_to_pool(lua_api)
 		active_tab.lua_apis.clear()
 		
 		var existing_postprocess = []
@@ -339,7 +502,7 @@ func render_content(html_bytes: PackedByteArray) -> void:
 			if existing_overlay:
 				existing_overlay.queue_free()
 	else:
-		var existing_lua_apis = []
+		var existing_lua_apis: Array[LuaAPI] = []
 		for child in get_children():
 			if child is LuaAPI:
 				existing_lua_apis.append(child)
@@ -374,132 +537,76 @@ func render_content(html_bytes: PackedByteArray) -> void:
 	
 	for child in target_container.get_children():
 		child.queue_free()
-	
-	font_dependent_elements.clear()
-	FontManager.clear_fonts()
-	FontManager.set_refresh_callback(refresh_fonts)
-	
-	var parser: HTMLParser = HTMLParser.new(html_bytes)
-	var parse_result = parser.parse()
-	
-	parser.process_styles()
-	
-	if parse_result.external_css and not parse_result.external_css.is_empty():
-		await parser.process_external_styles(current_domain)
-	
-	# Process and load all custom fonts defined in <font> tags
-	parser.process_fonts()
-	FontManager.load_all_fonts()
-	
-	if parse_result.errors.size() > 0:
-		print("Parse errors: " + str(parse_result.errors))
-	
-	var tab = active_tab
-	
-	var title = parser.get_title()
-	tab.set_title(title)
-	
-	var icon = parser.get_icon()
-	tab.update_icon_from_url(icon)
-	
-	if not icon.is_empty():
-		tab.set_meta("parsed_icon_url", icon)
-	
-	var body = parser.find_first("body")
-	
-	if body:
-		var background_panel = active_tab.background_panel
-		
-		StyleManager.apply_body_styles(body, parser, target_container, background_panel)
-		
-		parser.register_dom_node(body, target_container)
-	
-	var scripts = parser.find_all("script")
-	
-	var lua_api = LuaAPI.new()
-	add_child(lua_api)
-	if active_tab:
-		active_tab.lua_apis.append(lua_api)
-	
-	lua_api.dom_parser = parser
-	
-	if lua_api.threaded_vm:
-		lua_api.threaded_vm.dom_parser = parser
 
+func _render_elements_progressively(body: HTMLParser.HTMLElement, parser: HTMLParser, target_container: Control) -> void:
 	var i = 0
-	if body:
-		while i < body.children.size():
-			var element: HTMLParser.HTMLElement = body.children[i]
-			
-			if should_group_as_inline(element):
-				# Create an HBoxContainer for consecutive inline elements
-				var inline_elements: Array[HTMLParser.HTMLElement] = []
+	var elements_processed = 0
+	var total_elements = body.children.size()
+	
+	print("Rendering ", total_elements, " elements progressively...")
+	
+	while i < body.children.size():
+		var element: HTMLParser.HTMLElement = body.children[i]
+		
+		if should_group_as_inline(element):
+			# Create an HBoxContainer for consecutive inline elements
+			var inline_elements: Array[HTMLParser.HTMLElement] = []
 
-				while i < body.children.size() and should_group_as_inline(body.children[i]):
-					inline_elements.append(body.children[i])
-					i += 1
+			while i < body.children.size() and should_group_as_inline(body.children[i]):
+				inline_elements.append(body.children[i])
+				i += 1
 
-				var hbox = HBoxContainer.new()
-				hbox.add_theme_constant_override("separation", 4)
+			var hbox = HBoxContainer.new()
+			hbox.add_theme_constant_override("separation", 4)
 
-				for inline_element in inline_elements:
-					var inline_node = await create_element_node(inline_element, parser, target_container)
-					if inline_node:
-						
-						# Input elements register their own DOM nodes in their init() function
-						if inline_element.tag_name not in ["input", "textarea", "select", "button", "audio"]:
-							parser.register_dom_node(inline_element, inline_node)
-						
-						safe_add_child(hbox, inline_node)
-						# Handle hyperlinks for all inline elements
-						if contains_hyperlink(inline_element) and inline_node is RichTextLabel:
-							inline_node.meta_clicked.connect(handle_link_click)
-					else:
-						print("Failed to create inline element node: ", inline_element.tag_name)
-
-				safe_add_child(target_container, hbox)
-				continue
-			
-			var element_node = await create_element_node(element, parser, target_container)
-			if element_node:
-				
-				# Input elements register their own DOM nodes in their init() function
-				if element.tag_name not in ["input", "textarea", "select", "button", "audio", "canvas"]:
-					parser.register_dom_node(element, element_node)
-				
-				# ul/ol handle their own adding
-				if element.tag_name != "ul" and element.tag_name != "ol":
-					safe_add_child(target_container, element_node)
+			for inline_element in inline_elements:
+				var inline_node = await create_element_node(inline_element, parser, target_container)
+				if inline_node:
 					
+					# Input elements register their own DOM nodes in their init() function
+					if inline_element.tag_name not in ["input", "textarea", "select", "button", "audio"]:
+						parser.register_dom_node(inline_element, inline_node)
+					
+					safe_add_child(hbox, inline_node)
+					# Handle hyperlinks for all inline elements
+					if contains_hyperlink(inline_element) and inline_node is RichTextLabel:
+						inline_node.meta_clicked.connect(handle_link_click)
+				else:
+					print("Failed to create inline element node: ", inline_element.tag_name)
 
-				if contains_hyperlink(element):
-					if element_node is RichTextLabel:
-						element_node.meta_clicked.connect(handle_link_click)
-					elif element_node.has_method("get") and element_node.get("rich_text_label"):
-						element_node.rich_text_label.meta_clicked.connect(handle_link_click)
-			else:
-				print("Couldn't parse unsupported HTML tag \"%s\"" % element.tag_name)
+			safe_add_child(target_container, hbox)
+			continue
+		
+		var element_node = await create_element_node(element, parser, target_container)
+		if element_node:
 			
-			i += 1
-	
-	if scripts.size() > 0 and lua_api:
-		parser.process_scripts(lua_api, null)
-		if parse_result.external_scripts and not parse_result.external_scripts.is_empty():
-			# Extract base URL without query parameters for script resolution
-			var base_url_for_scripts = current_domain
-			var query_pos = base_url_for_scripts.find("?")
-			if query_pos != -1:
-				base_url_for_scripts = base_url_for_scripts.substr(0, query_pos)
-			await parser.process_external_scripts(lua_api, null, base_url_for_scripts)
-	
-	var postprocess_element = parser.process_postprocess()
-	if postprocess_element:
-		var postprocess_node = POSTPROCESS.instantiate()
-		add_child(postprocess_node)
-		await postprocess_node.init(postprocess_element, parser)
-	
-	active_tab.current_url = current_domain
-	active_tab.has_content = true
+			# Input elements register their own DOM nodes in their init() function
+			if element.tag_name not in ["input", "textarea", "select", "button", "audio", "canvas"]:
+				parser.register_dom_node(element, element_node)
+			
+			# ul/ol handle their own adding
+			if element.tag_name != "ul" and element.tag_name != "ol":
+				safe_add_child(target_container, element_node)
+				
+
+			if contains_hyperlink(element):
+				if element_node is RichTextLabel:
+					element_node.meta_clicked.connect(handle_link_click)
+				elif element_node.has_method("get") and element_node.get("rich_text_label"):
+					element_node.rich_text_label.meta_clicked.connect(handle_link_click)
+		else:
+			print("Couldn't parse unsupported HTML tag \"%s\"" % element.tag_name)
+		
+		i += 1
+		elements_processed += 1
+		
+		# Yield every few elements to prevent blocking
+		if elements_processed >= max_elements_per_frame:
+			# Update progress
+			var progress = float(i) / float(total_elements) * 100.0
+			print("Rendering progress: ", "%.1f" % progress, "% (", i, "/", total_elements, ")")
+			await get_tree().process_frame
+			elements_processed = 0
 
 static func safe_add_child(parent: Node, child: Node) -> void:
 	if child.get_parent():
@@ -666,6 +773,7 @@ func create_element_node(element: HTMLParser.HTMLElement, parser: HTMLParser, co
 		skip_general_processing = not is_flex_container and not is_grid_container
 	
 	if not skip_general_processing:
+		var child_count = 0
 		for child_element in element.children:
 			# Only add child nodes if the child is NOT an inline element
 			# UNLESS the parent is a flex or grid container (inline elements become flex/grid items)
@@ -682,6 +790,11 @@ func create_element_node(element: HTMLParser.HTMLElement, parser: HTMLParser, co
 							child_node.meta_clicked.connect(handle_link_click)
 						elif child_node.has_method("get") and child_node.get("rich_text_label"):
 							child_node.rich_text_label.meta_clicked.connect(handle_link_click)
+				
+				child_count += 1
+				# Yield every few child elements to prevent blocking
+				if child_count % max_children_per_yield == 0:
+					await get_tree().process_frame
 
 	return final_node
 
@@ -932,3 +1045,184 @@ func _handle_startup_behavior():
 	
 	if startup_behavior.specific_page and not startup_behavior.url.is_empty():
 		_on_search_submitted(startup_behavior.url, true)
+
+func _setup_memory_monitoring():
+	memory_check_timer = Timer.new()
+	memory_check_timer.wait_time = 5.0  # Check every 5 seconds
+	memory_check_timer.timeout.connect(_check_memory_usage)
+	add_child(memory_check_timer)
+	memory_check_timer.start()
+
+func _check_memory_usage():
+	var current_time = Time.get_ticks_msec()
+	if current_time - last_memory_check < 5000:  # Don't check too frequently
+		return
+	
+	last_memory_check = current_time
+	
+	# Get memory usage statistics
+	var memory_usage = OS.get_static_memory_usage()
+	var memory_peak = OS.get_static_memory_peak_usage()
+	
+	# Log memory usage if it's getting high
+	if memory_usage > 100 * 1024 * 1024:  # 100MB threshold
+		print("High memory usage detected: ", memory_usage / 1024 / 1024, "MB")
+		print("Peak memory usage: ", memory_peak / 1024 / 1024, "MB")
+		
+		# Force garbage collection
+		call_deferred("_force_garbage_collection")
+
+func _force_garbage_collection():
+	# Clean up any orphaned resources
+	FontManager.clear_fonts()
+	
+	# Clear any unused Lua APIs from pool
+	var cleaned_apis: Array[LuaAPI] = []
+	for lua_api in lua_api_pool:
+		if is_instance_valid(lua_api):
+			cleaned_apis.append(lua_api)
+		else:
+			lua_api.queue_free()
+	lua_api_pool = cleaned_apis
+	
+	# Force garbage collection
+	OS.request_permission("memory")
+
+func _exit_tree():
+	# Stop memory monitoring
+	if memory_check_timer:
+		memory_check_timer.stop()
+		memory_check_timer.queue_free()
+	
+	# Global cleanup when main node is removed
+	cleanup_all_resources()
+
+func get_lua_api_from_pool() -> LuaAPI:
+	if lua_api_pool.size() > 0:
+		return lua_api_pool.pop_back()
+	else:
+		return LuaAPI.new()
+
+func return_lua_api_to_pool(lua_api: LuaAPI):
+	if lua_api_pool.size() < max_pool_size and is_instance_valid(lua_api):
+		lua_api.kill_script_execution()
+		lua_api_pool.append(lua_api)
+	else:
+		if is_instance_valid(lua_api):
+			lua_api.kill_script_execution()
+			lua_api.queue_free()
+
+func _is_binary_file(content: PackedByteArray) -> bool:
+	# Check for null bytes or high ASCII values that indicate binary content
+	if content.size() == 0:
+		return false
+	
+	# Check first 1024 bytes for binary indicators
+	var check_size = min(content.size(), 1024)
+	var null_count = 0
+	var high_ascii_count = 0
+	
+	for i in range(check_size):
+		var byte = content[i]
+		if byte == 0:
+			null_count += 1
+		elif byte > 127:  # High ASCII or non-ASCII
+			high_ascii_count += 1
+	
+	# If more than 10% null bytes or 30% high ASCII, likely binary
+	return (null_count > check_size * 0.1) or (high_ascii_count > check_size * 0.3)
+
+func handle_binary_file(file_path: String, content: PackedByteArray, tab: Tab, original_url: String, file_url: String, add_to_history: bool = true) -> void:
+	var file_name = file_path.get_file()
+	var file_extension = file_path.get_extension().to_lower()
+	var file_size = content.size()
+	
+	# Create appropriate content based on file type
+	var wrapped_html = ""
+	
+	if file_extension in ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"]:
+		# Handle images
+		var base64_data = Marshalls.raw_to_base64(content)
+		var mime_type = "image/" + file_extension
+		if file_extension == "jpg" or file_extension == "jpeg":
+			mime_type = "image/jpeg"
+		elif file_extension == "svg":
+			mime_type = "image/svg+xml"
+		
+		wrapped_html = """<head>
+	<title>""" + file_name + """</title>
+	<style>
+		body { bg-[#ffffff] text-[#202124] font-sans p-6 m-0 text-center }
+		.image-container { max-w-[800px] mx-auto }
+		.image-info { text-sm text-[#5f6368] mt-4 }
+	</style>
+</head>
+<body>
+	<h1>""" + file_name + """</h1>
+	<div class="image-container">
+		<img src="data:""" + mime_type + ";base64," + base64_data + """ alt=\"""" + file_name + """\" style="max-width: 100%; height: auto;">
+		<div class="image-info">
+			<p>File: """ + file_name + """</p>
+			<p>Size: """ + str(file_size) + """ bytes</p>
+			<p>Type: """ + mime_type + """</p>
+		</div>
+	</div>
+</body>"""
+	else:
+		# Handle other binary files
+		wrapped_html = """<head>
+	<title>""" + file_name + """</title>
+	<style>
+		body { bg-[#ffffff] text-[#202124] font-sans p-6 m-0 }
+		.file-info { bg-[#f8f9fa] p-4 rounded-md mb-4 }
+		.binary-warning { bg-[#fff3cd] border border-[#ffeaa7] text-[#856404] p-3 rounded-md }
+	</style>
+</head>
+<body>
+	<h1>""" + file_name + """</h1>
+	<div class="file-info">
+		<p><strong>File:</strong> """ + file_name + """</p>
+		<p><strong>Size:</strong> """ + str(file_size) + """ bytes</p>
+		<p><strong>Type:</strong> Binary file (.""" + file_extension + """)</p>
+	</div>
+	<div class="binary-warning">
+		<p><strong>Binary File Detected</strong></p>
+		<p>This file contains binary data and cannot be displayed as text. Download the file to view its contents.</p>
+	</div>
+</body>"""
+	
+	handle_local_file_result({"success": true, "html_bytes": wrapped_html.to_utf8_buffer()}, tab, original_url, file_url, add_to_history)
+
+func cleanup_all_resources():
+	# Clean up all tabs and their resources
+	for tab in tab_container.tabs:
+		if is_instance_valid(tab):
+			tab._exit_tree()
+	
+	# Clean up network resources
+	NetworkManager.clear_all_requests()
+	
+	# Clean up font resources
+	FontManager.clear_fonts()
+	
+	# Clean up WebSocket resources
+	LuaWebSocketUtils.cleanup_all_websockets()
+	
+	# Clean up Lua API pool
+	for lua_api in lua_api_pool:
+		if is_instance_valid(lua_api):
+			lua_api.kill_script_execution()
+			lua_api.queue_free()
+	lua_api_pool.clear()
+	
+	# Clean up any remaining Lua APIs
+	var remaining_lua_apis: Array[LuaAPI] = []
+	for child in get_children():
+		if child is LuaAPI:
+			remaining_lua_apis.append(child)
+	
+	for lua_api in remaining_lua_apis:
+		if is_instance_valid(lua_api):
+			lua_api.kill_script_execution()
+			remove_child(lua_api)
+			lua_api.queue_free()

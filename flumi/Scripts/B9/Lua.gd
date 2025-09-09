@@ -408,7 +408,8 @@ func _on_body_mouse_exit(subscription: EventSubscription) -> void:
 	_handle_body_event(subscription, "mouseexit", {})
 
 func _execute_lua_callback(subscription: EventSubscription, args: Array = []) -> void:
-	threaded_vm.execute_callback_async(subscription.callback_ref, args)
+	if threaded_vm:
+		threaded_vm.execute_callback_async(subscription.callback_ref, args)
 
 func _execute_input_event_callback(subscription: EventSubscription, event_data: Dictionary) -> void:
 	if not event_subscriptions.has(subscription.id):
@@ -635,6 +636,10 @@ func get_dom_node(node: Node, purpose: String = "general") -> Node:
 
 # Main execution function
 func execute_lua_script(code: String):
+	if not threaded_vm:
+		print("Error: ThreadedVM is null, cannot execute script")
+		return
+		
 	if not threaded_vm.lua_thread or not threaded_vm.lua_thread.is_alive():
 		# Start the thread if it's not running
 		threaded_vm.start_lua_thread(dom_parser, self)
@@ -652,17 +657,74 @@ func _on_print_output(message: Dictionary):
 	Trace.get_instance().log_message.emit(message, "lua", Time.get_ticks_msec() / 1000.0)
 
 func kill_script_execution():
-	threaded_vm.stop_lua_thread()
+	# Clean up all timeouts first
+	if timeout_manager:
+		timeout_manager.cleanup_all_timeouts()
+	
+	# Disconnect all event subscriptions
+	for subscription_id in event_subscriptions:
+		var subscription = event_subscriptions[subscription_id]
+		if subscription.connected_node and is_instance_valid(subscription.connected_node):
+			if subscription.connected_signal != "":
+				subscription.connected_node.disconnect(subscription.connected_signal, subscription.wrapper_func)
+		# Clean up Lua callback reference
+		if subscription.vm and subscription.callback_ref > 0:
+			subscription.vm.lua_pushstring("GURT_CALLBACKS")
+			subscription.vm.lua_rawget(subscription.vm.LUA_REGISTRYINDEX)
+			if not subscription.vm.lua_isnil(-1):
+				subscription.vm.lua_pushinteger(subscription.callback_ref)
+				subscription.vm.lua_pushnil()
+				subscription.vm.lua_rawset(-3)
+			subscription.vm.lua_pop(1)
+	
+	event_subscriptions.clear()
+	pending_event_registrations.clear()
+	element_id_registry.clear()
+	
+	# Stop and clean up threaded VM
+	if threaded_vm:
+		threaded_vm.stop_lua_thread()
+	
+	# Clean up timeout manager
+	if timeout_manager:
+		timeout_manager.cleanup_all_timeouts()
+		timeout_manager = null
+	
 	# Restart a fresh thread for future scripts
+	threaded_vm = ThreadedLuaVM.new()
+	threaded_vm.script_completed.connect(_on_threaded_script_completed)
+	threaded_vm.script_error.connect(_on_threaded_script_error)
+	threaded_vm.dom_operation_request.connect(_handle_dom_operation)
+	threaded_vm.print_output.connect(_on_print_output)
+	
+	timeout_manager = LuaTimeoutManager.new()
 	threaded_vm.start_lua_thread(dom_parser, self)
 
 func is_script_hanging() -> bool:
-	return threaded_vm.lua_thread != null and threaded_vm.lua_thread.is_alive()
+	return threaded_vm != null and threaded_vm.lua_thread != null and threaded_vm.lua_thread.is_alive()
 
 func get_script_runtime() -> float:
 	if script_start_time > 0 and is_script_hanging():
 		return (Time.get_ticks_msec() / 1000.0) - script_start_time
 	return 0.0
+
+func _exit_tree():
+	# Comprehensive cleanup when the node is removed
+	kill_script_execution()
+	
+	# Clean up any remaining timers
+	for child in get_children():
+		if child is Timer:
+			child.stop()
+			child.queue_free()
+	
+	# Disconnect all signals
+	if threaded_vm:
+		threaded_vm.script_completed.disconnect(_on_threaded_script_completed)
+		threaded_vm.script_error.disconnect(_on_threaded_script_error)
+		threaded_vm.dom_operation_request.disconnect(_handle_dom_operation)
+		threaded_vm.print_output.disconnect(_on_print_output)
+		threaded_vm = null
 
 func _handle_dom_operation(operation: Dictionary):
 	match operation.type:
@@ -996,7 +1058,8 @@ func _notification(what: int):
 	if what == NOTIFICATION_PREDELETE:
 		if timeout_manager:
 			timeout_manager.cleanup_all_timeouts()
-		threaded_vm.stop_lua_thread()
+		if threaded_vm:
+			threaded_vm.stop_lua_thread()
 
 func _handle_download_request(operation: Dictionary):
 	var download_data = operation.get("download_data", {})

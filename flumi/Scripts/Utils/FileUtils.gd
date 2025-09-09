@@ -29,7 +29,12 @@ static func is_html_file(file_path: String) -> bool:
 
 static func is_supported_file(file_path: String) -> bool:
 	var extension = file_path.get_extension().to_lower()
-	return extension in ["html", "htm", "txt", "css", "js"]
+	return extension in ["html", "htm", "txt", "css", "js", "png", "jpg", "jpeg", "gif", "webp", "svg", "bmp"]
+
+static func is_binary_file(file_path: String) -> bool:
+	var extension = file_path.get_extension().to_lower()
+	# Common binary file extensions
+	return extension in ["png", "jpg", "jpeg", "gif", "webp", "svg", "bmp", "exe", "dll", "so", "dylib", "bin", "zip", "rar", "7z", "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx", "mp3", "mp4", "avi", "mov", "wav", "ogg"]
 
 static func create_error_page(title: String, error_message: String) -> PackedByteArray:
 	var html = """<head>

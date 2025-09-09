@@ -119,28 +119,50 @@ func stop_loading() -> void:
 		loading_tween = null
 
 func _exit_tree():
+	# Stop loading animation
 	if loading_tween:
 		loading_tween.kill()
 		loading_tween = null
 	
+	# Clean up all Lua APIs and their resources
 	for lua_api in lua_apis:
 		if is_instance_valid(lua_api):
 			lua_api.kill_script_execution()
+			# Clean up any remaining child timers
+			for child in lua_api.get_children():
+				if child is Timer:
+					child.stop()
+					child.queue_free()
 			lua_api.queue_free()
 	lua_apis.clear()
 	
+	# Clean up containers
 	if scroll_container and is_instance_valid(scroll_container):
+		# Clean up all children first
+		for child in scroll_container.get_children():
+			child.queue_free()
 		if scroll_container.get_parent():
 			scroll_container.get_parent().remove_child(scroll_container)
 		scroll_container.queue_free()
 	
 	if background_panel and is_instance_valid(background_panel):
+		# Clean up all children first
+		for child in background_panel.get_children():
+			child.queue_free()
 		if background_panel.get_parent():
 			background_panel.get_parent().remove_child(background_panel)
 		background_panel.queue_free()
 	
 	if dev_tools and is_instance_valid(dev_tools):
 		dev_tools.queue_free()
+	
+	# Clear navigation history
+	navigation_history.clear()
+	history_index = -1
+	
+	# Clear any remaining metadata
+	remove_meta("original_icon_url")
+	remove_meta("parsed_icon_url")
 	
 	remove_from_group("tabs")
 

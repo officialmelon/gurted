@@ -4,6 +4,14 @@ extends RefCounted
 static var websocket_instances: Dictionary = {}
 static var instance_counter: int = 0
 
+static func cleanup_all_websockets():
+	for instance_id in websocket_instances:
+		var wrapper = websocket_instances[instance_id]
+		if wrapper and is_instance_valid(wrapper):
+			wrapper.close()
+	websocket_instances.clear()
+	instance_counter = 0
+
 class WebSocketWrapper:
 	extends RefCounted
 	
