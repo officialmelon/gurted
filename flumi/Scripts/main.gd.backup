@@ -1,14 +1,6 @@
 class_name Main
 extends Control
 
-# Import cache managers and performance optimizations
-const StyleCache = preload("res://Scripts/Engine/StyleCacheManager.gd")
-const FontCache = preload("res://Scripts/Engine/FontCacheManager.gd")
-const DeferredStyleManager = preload("res://Scripts/Engine/DeferredStyleManager.gd")
-const ThreadRenderer = preload("res://Scripts/Engine/ThreadedRenderer.gd")
-const DOMBuilder = preload("res://Scripts/Engine/AsyncDOMBuilder.gd")
-const StyleQueue = preload("res://Scripts/Engine/StyleQueueManager.gd")
-
 @onready var website_container: Control = %WebsiteContainer
 @onready var tab_container: TabManager = $VBoxContainer/TabContainer
 @onready var search_bar: LineEdit = $VBoxContainer/HBoxContainer/LineEdit
@@ -54,11 +46,6 @@ var network_start_time: float = 0.0
 var network_end_time: float = 0.0
 var download_manager: DownloadManager = null
 
-# Threaded rendering components
-var threaded_renderer
-var async_dom_builder  
-var style_queue_manager
-
 func should_group_as_inline(element: HTMLParser.HTMLElement) -> bool:
 	if element.tag_name == "input":
 		var parent = element.parent
@@ -76,11 +63,6 @@ func _ready():
 	DisplayServer.window_set_min_size(MIN_SIZE)
 	
 	CertificateManager.initialize()
-	
-	# Initialize threaded rendering components
-	threaded_renderer = ThreadRenderer.new()
-	async_dom_builder = DOMBuilder.new()  
-	style_queue_manager = StyleQueue.new()
 	
 	download_manager = DOWNLOAD_MANAGER.new(self)
 	add_child(download_manager)
@@ -129,6 +111,8 @@ func _on_search_submitted(url: String, add_to_history: bool = true) -> void:
 		
 		await fetch_local_file_content_async(url, tab, url, add_to_history)
 	elif GurtProtocol.is_gurt_domain(url):
+		print("Processing as GURT domain")
+		
 		var tab = tab_container.tabs[tab_container.active_tab]
 		tab.start_loading()
 		
@@ -149,8 +133,6 @@ func _on_search_submitted(url: String, add_to_history: bool = true) -> void:
 			_on_search_submitted(search_url, add_to_history)
 
 func fetch_gurt_content_async(gurt_url: String, tab: Tab, original_url: String, add_to_history: bool = true) -> void:
-	tab.update_loading_progress("connecting")
-	
 	main_navigation_request = NetworkManager.start_request(gurt_url, "GET", false)
 	main_navigation_request.type = NetworkRequest.RequestType.DOC
 	network_start_time = Time.get_ticks_msec()
@@ -160,13 +142,8 @@ func fetch_gurt_content_async(gurt_url: String, tab: Tab, original_url: String, 
 	
 	thread.start(_perform_gurt_request_threaded.bind(request_data))
 	
-	tab.update_loading_progress("loading")
-	
-	# Check thread status more frequently to stay responsive
 	while thread.is_alive():
-		# Yield multiple frames to keep UI more responsive (increased from 3 to 5)
-		for i in range(5):
-			await get_tree().process_frame
+		await get_tree().process_frame
 	
 	var result = thread.wait_to_finish()
 	
@@ -199,8 +176,6 @@ func _perform_gurt_request_threaded(request_data: Dictionary) -> Dictionary:
 	return {"success": true, "html_bytes": response.body}
 
 func fetch_local_file_content_async(file_url: String, tab: Tab, original_url: String, add_to_history: bool = true) -> void:
-	tab.update_loading_progress("connecting")
-	
 	var file_path = URLUtils.file_url_to_path(file_url)
 	
 	if FileUtils.is_directory(file_path):
@@ -214,8 +189,6 @@ func fetch_local_file_content_async(file_url: String, tab: Tab, original_url: St
 	if not FileUtils.is_supported_file(file_path):
 		handle_local_file_error("Unsupported file type: " + file_path.get_extension(), tab)
 		return
-	
-	tab.update_loading_progress("loading")
 	
 	var result = FileUtils.read_local_file(file_path)
 	
@@ -332,28 +305,16 @@ func render_content(html_bytes: PackedByteArray) -> void:
 		NetworkManager.clear_all_requests()
 	
 	var active_tab = get_active_tab()
-	var original_active_tab = active_tab  # Store reference for tab-switch detection
-	if not active_tab:
-		return
+	var target_container: Control
+	
+	if active_tab and active_tab.website_container:
+		target_container = active_tab.website_container
+	else:
+		target_container = website_container
 		
-	var target_container = active_tab.website_container if active_tab.website_container else website_container
 	if not target_container:
+		print("Error: No container available for rendering")
 		return
-	
-	# Start threaded renderer if not running
-	ThreadRenderer.start_render_thread()
-	
-	# Clear existing content immediately (non-blocking)
-	await clear_container_content(active_tab, target_container)
-	
-	# Queue parsing on background thread
-	var render_id = ThreadRenderer.queue_render(html_bytes, current_domain, str(active_tab.get_instance_id()), self)
-	
-	# Start checking for completion (non-blocking)
-	_monitor_threaded_render(render_id, active_tab, target_container)
-	
-	# Yield before cleanup to keep UI responsive
-	await get_tree().process_frame
 	
 	if active_tab:
 		var existing_tab_lua_apis = active_tab.lua_apis
@@ -363,9 +324,6 @@ func render_content(html_bytes: PackedByteArray) -> void:
 				remove_child(lua_api)
 				lua_api.queue_free()
 		active_tab.lua_apis.clear()
-		
-		# Yield after clearing Lua APIs
-		await get_tree().process_frame
 		
 		var existing_postprocess = []
 		for child in get_children():
@@ -390,9 +348,6 @@ func render_content(html_bytes: PackedByteArray) -> void:
 			lua_api.kill_script_execution()
 			remove_child(lua_api)
 			lua_api.queue_free()
-	
-	# Yield after cleanup
-	await get_tree().process_frame
 	
 	var postprocess_nodes: Array[Node] = []
 	for child in get_children():
@@ -420,31 +375,14 @@ func render_content(html_bytes: PackedByteArray) -> void:
 	for child in target_container.get_children():
 		child.queue_free()
 	
-	# Yield after clearing container children
-	await get_tree().process_frame
-	
 	font_dependent_elements.clear()
 	FontManager.clear_fonts()
 	FontManager.set_refresh_callback(refresh_fonts)
 	
-	# Update progress and yield before heavy parsing
-	if active_tab:
-		active_tab.update_loading_progress("parsing")
-	await get_tree().process_frame
-	
 	var parser: HTMLParser = HTMLParser.new(html_bytes)
 	var parse_result = parser.parse()
 	
-	# Yield after parsing
-	await get_tree().process_frame
-	
-	if active_tab:
-		active_tab.update_loading_progress("styling")
-	
 	parser.process_styles()
-	
-	# Yield after processing styles
-	await get_tree().process_frame
 	
 	if parse_result.external_css and not parse_result.external_css.is_empty():
 		await parser.process_external_styles(current_domain)
@@ -453,20 +391,13 @@ func render_content(html_bytes: PackedByteArray) -> void:
 	parser.process_fonts(current_domain)
 	FontManager.load_all_fonts()
 	
-	# Yield after font loading
-	await get_tree().process_frame
-	
 	if parse_result.errors.size() > 0:
 		print("Parse errors: " + str(parse_result.errors))
 	
 	var tab = active_tab
 	
-	if tab:
-		tab.update_loading_progress("rendering")
-	
 	var title = parser.get_title()
-	if tab:
-		tab.set_title(title)
+	tab.set_title(title)
 	
 	var icon = parser.get_icon()
 	tab.update_icon_from_url(icon)
@@ -500,13 +431,6 @@ func render_content(html_bytes: PackedByteArray) -> void:
 		while i < body.children.size():
 			var element: HTMLParser.HTMLElement = body.children[i]
 			
-			# Yield control to keep UI responsive every 2 elements (more aggressive)
-			if i > 0 and i % 2 == 0:
-				await get_tree().process_frame
-				# Check if user switched tabs during rendering - abort if they did
-				if get_active_tab() != original_active_tab:
-					return
-			
 			if should_group_as_inline(element):
 				# Create an HBoxContainer for consecutive inline elements
 				var inline_elements: Array[HTMLParser.HTMLElement] = []
@@ -518,12 +442,7 @@ func render_content(html_bytes: PackedByteArray) -> void:
 				var hbox = HBoxContainer.new()
 				hbox.add_theme_constant_override("separation", 4)
 
-				var inline_count = 0
 				for inline_element in inline_elements:
-					# Yield for every inline element to stay responsive
-					if inline_count > 0:
-						await get_tree().process_frame
-					
 					var inline_node = await create_element_node(inline_element, parser, target_container)
 					if inline_node:
 						
@@ -537,8 +456,6 @@ func render_content(html_bytes: PackedByteArray) -> void:
 							inline_node.meta_clicked.connect(handle_link_click)
 					else:
 						print("Failed to create inline element node: ", inline_element.tag_name)
-					
-					inline_count += 1
 
 				safe_add_child(target_container, hbox)
 				continue
@@ -566,14 +483,7 @@ func render_content(html_bytes: PackedByteArray) -> void:
 			i += 1
 	
 	if scripts.size() > 0 and lua_api:
-		if active_tab:
-			active_tab.update_loading_progress("scripts")
-		
-		# Yield before processing scripts
-		await get_tree().process_frame
-		
 		parser.process_scripts(lua_api, null)
-		
 		if parse_result.external_scripts and not parse_result.external_scripts.is_empty():
 			# Extract base URL without query parameters for script resolution
 			var base_url_for_scripts = current_domain
@@ -582,21 +492,14 @@ func render_content(html_bytes: PackedByteArray) -> void:
 				base_url_for_scripts = base_url_for_scripts.substr(0, query_pos)
 			await parser.process_external_scripts(lua_api, null, base_url_for_scripts)
 	
-	if active_tab:
-		active_tab.update_loading_progress("finalizing")
-	
 	var postprocess_element = parser.process_postprocess()
 	if postprocess_element:
 		var postprocess_node = POSTPROCESS.instantiate()
 		add_child(postprocess_node)
 		await postprocess_node.init(postprocess_element, parser)
 	
-	if active_tab:
-		active_tab.current_url = current_domain
-		active_tab.has_content = true
-		
-		# Start processing deferred styles in background
-		DeferredStyleManager.process_deferred_queue_async()
+	active_tab.current_url = current_domain
+	active_tab.has_content = true
 
 static func safe_add_child(parent: Node, child: Node) -> void:
 	if child.get_parent():
@@ -636,8 +539,6 @@ func create_element_node(element: HTMLParser.HTMLElement, parser: HTMLParser, co
 		final_node = await create_element_node_internal(element, parser, container if container else get_active_website_container())
 		if not final_node:
 			return null
-		# Yield before styling inline elements
-		await get_tree().process_frame
 		final_node = StyleManager.apply_element_styles(final_node, element, parser)
 		# Flex item properties may still apply
 		FlexUtils.apply_flex_item_properties(final_node, styles)
@@ -724,8 +625,6 @@ func create_element_node(element: HTMLParser.HTMLElement, parser: HTMLParser, co
 			container_for_children = final_node
 
 	# Applies background, size, etc. to the FlexContainer (top-level node)
-	# Yield before heavy styling to keep UI responsive
-	await get_tree().process_frame
 	final_node = StyleManager.apply_element_styles(final_node, element, parser)
 
 	if final_node and final_node.has_meta("needs_size_expand_fill"):
@@ -767,14 +666,7 @@ func create_element_node(element: HTMLParser.HTMLElement, parser: HTMLParser, co
 		skip_general_processing = not is_flex_container and not is_grid_container
 	
 	if not skip_general_processing:
-		var child_count = 0
 		for child_element in element.children:
-			# Yield control periodically when processing many child elements (more aggressive)
-			if child_count > 0 and child_count % 2 == 0:
-				await get_tree().process_frame
-				# Note: Tab switching detection would require passing active_tab reference
-				# Removed tab switch detection here to avoid scope issues
-			
 			# Only add child nodes if the child is NOT an inline element
 			# UNLESS the parent is a flex or grid container (inline elements become flex/grid items)
 			if not child_element.is_inline_element() or is_flex_container or is_grid_container:
@@ -790,8 +682,6 @@ func create_element_node(element: HTMLParser.HTMLElement, parser: HTMLParser, co
 							child_node.meta_clicked.connect(handle_link_click)
 						elif child_node.has_method("get") and child_node.get("rich_text_label"):
 							child_node.rich_text_label.meta_clicked.connect(handle_link_click)
-			
-			child_count += 1
 
 	return final_node
 
@@ -898,8 +788,6 @@ func create_element_node_internal(element: HTMLParser.HTMLElement, parser: HTMLP
 				var p_node = P.instantiate()
 				p_node.init(element, parser)
 				
-				# Yield before heavy div styling
-				await get_tree().process_frame
 				var div_styles = parser.get_element_styles_with_inheritance(element, "", [])
 				StyleManager.apply_styles_to_label(p_node, div_styles, element, parser)
 				
@@ -1043,130 +931,3 @@ func _handle_startup_behavior():
 	
 	if startup_behavior.specific_page and not startup_behavior.url.is_empty():
 		_on_search_submitted(startup_behavior.url, true)
-
-func clear_container_content(active_tab: Tab, target_container: Control) -> void:
-	# Clear existing content quickly
-	if active_tab:
-		# Clear Lua APIs
-		for lua_api in active_tab.lua_apis:
-			if is_instance_valid(lua_api):
-				lua_api.kill_script_execution()
-				remove_child(lua_api)
-				lua_api.queue_free()
-		active_tab.lua_apis.clear()
-		
-		# Clear postprocess
-		for child in get_children():
-			if child is HTMLPostprocess:
-				remove_child(child)
-				child.queue_free()
-	
-	# Clear container children
-	for child in target_container.get_children():
-		child.queue_free()
-	
-	# Clear caches
-	font_dependent_elements.clear()
-	FontManager.clear_fonts()
-	
-	# Yield once to allow cleanup
-	await get_tree().process_frame
-
-func _monitor_threaded_render(render_id: String, active_tab: Tab, target_container: Control):
-	# Monitor for completion without blocking
-	while true:
-		await get_tree().process_frame
-		
-		var completed = ThreadRenderer.check_completed_renders()
-		
-		for result in completed:
-			if result.task_id == render_id:
-				await _apply_threaded_render_result(result, active_tab, target_container)
-				return
-		
-		# Check if tab is still active/loading
-		if get_active_tab() != active_tab:
-			return
-
-func _apply_threaded_render_result(result: Dictionary, active_tab: Tab, target_container: Control):
-	if not result.success:
-		return
-	
-	var parser: HTMLParser = result.parser
-	var body = result.body
-	
-	# Set tab title/icon immediately
-	if active_tab:
-		active_tab.set_title(result.title)
-		active_tab.update_icon_from_url(result.icon)
-		active_tab.update_loading_progress("rendering")
-	
-	# Apply body styles
-	if body and active_tab:
-		StyleManager.apply_body_styles(body, parser, target_container, active_tab.background_panel)
-		parser.register_dom_node(body, target_container)
-	
-	# Build DOM incrementally (non-blocking)
-	if body:
-		var success = await DOMBuilder.build_dom_async(parser, body, target_container, self)
-		if not success:
-			return  # Aborted
-	
-	# Start background styling
-	StyleQueue.process_styling_queue_async()
-	
-	# Handle scripts
-	if result.scripts.size() > 0:
-		await _process_scripts_async(result.scripts, parser, active_tab)
-	
-	# Finalize
-	if active_tab:
-		active_tab.current_url = result.current_domain
-		active_tab.has_content = true
-		active_tab.update_loading_progress("finalizing")
-		active_tab.stop_loading()
-
-func _process_scripts_async(scripts: Array, parser: HTMLParser, active_tab: Tab):
-	if scripts.is_empty():
-		return
-		
-	active_tab.update_loading_progress("scripts")
-	
-	var lua_api = LuaAPI.new()
-	add_child(lua_api)
-	active_tab.lua_apis.append(lua_api)
-	lua_api.dom_parser = parser
-	
-	if lua_api.threaded_vm:
-		lua_api.threaded_vm.dom_parser = parser
-	
-	# Process scripts in small chunks
-	await get_tree().process_frame
-	parser.process_scripts(lua_api, null)
-
-# Lightweight element creation for non-blocking rendering
-func create_element_node_lightweight(element: HTMLParser.HTMLElement, parser: HTMLParser, container: Control = null) -> Control:
-	# This is a simplified version for the async DOM builder
-	var node: Control = null
-	
-	match element.tag_name:
-		"p", "h1", "h2", "h3", "h4", "h5", "h6":
-			node = P.instantiate()
-			node.init(element, parser)
-		"div":
-			node = DIV.instantiate()
-			node.init(element, parser)
-		"img":
-			node = IMG.instantiate()
-			node.init(element, parser)
-		"br":
-			node = BR.instantiate()
-			node.init(element, parser)
-		"span", "b", "i", "u", "small", "mark", "code", "a":
-			node = SPAN.instantiate()
-			node.init(element, parser)
-		_:
-			# For complex elements, fall back to full creation
-			return await create_element_node_internal(element, parser, container)
-	
-	return node

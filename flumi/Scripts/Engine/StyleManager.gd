@@ -1,6 +1,11 @@
 class_name StyleManager
 extends RefCounted
 
+# Import cache managers and deferred styling
+const FontCache = preload("res://Scripts/Engine/FontCacheManager.gd")
+const StyleCache = preload("res://Scripts/Engine/StyleCacheManager.gd")
+const DeferredStyle = preload("res://Scripts/Engine/DeferredStyleManager.gd")
+
 static var body_text_color: Color = Color.BLACK
 
 static func parse_size(val):
@@ -29,7 +34,17 @@ static func parse_size(val):
 	return float(val)
 
 static func apply_element_styles(node: Control, element: HTMLParser.HTMLElement, parser: HTMLParser) -> Control:
-	var styles = parser.get_element_styles_with_inheritance(element, "", [])
+	var all_styles = parser.get_element_styles_with_inheritance(element, "", [])
+	
+	# Split styles into critical (immediate) and deferrable (later)
+	var style_split = DeferredStyle.split_styles(all_styles)
+	var styles = style_split.critical
+	var deferred_styles = style_split.deferrable
+	
+	# Queue deferred styles for later application
+	if not deferred_styles.is_empty():
+		DeferredStyle.queue_deferred_styling(node, element, parser, deferred_styles)
+	
 	var label = null
 	var target = null
 
@@ -76,7 +91,7 @@ static func apply_element_styles(node: Control, element: HTMLParser.HTMLElement,
 				else:
 					# For other percentages, convert to viewport-relative size
 					var percent = float(width.replace("%", "")) / 100.0
-					var viewport_width = node.get_viewport().get_visible_rect().size.x if node.get_viewport() else 800
+					var viewport_width = node.get_viewport().get_visible_rect().size.x if node.get_viewport() else 800.0
 					node.custom_minimum_size.x = viewport_width * percent
 					node.set_meta("size_flags_set_by_style_manager", true)
 					node.size_flags_horizontal = Control.SIZE_SHRINK_BEGIN
@@ -97,7 +112,7 @@ static func apply_element_styles(node: Control, element: HTMLParser.HTMLElement,
 				else:
 					# For other percentages, convert to viewport-relative size
 					var percent = float(height.replace("%", "")) / 100.0
-					var viewport_height = node.get_viewport().get_visible_rect().size.y if node.get_viewport() else 600
+					var viewport_height = node.get_viewport().get_visible_rect().size.y if node.get_viewport() else 600.0
 					node.custom_minimum_size.y = viewport_height * percent
 					node.set_meta("size_flags_set_by_style_manager", true)
 					node.size_flags_vertical = Control.SIZE_SHRINK_BEGIN
@@ -420,14 +435,17 @@ static func apply_styles_to_label(label: Control, styles: Dictionary, element: H
 	if not label is RichTextLabel:
 		return
 	
+	# Skip if no relevant styles to apply
+	if FontCache.should_skip_font_application(label, styles):
+		return
+	
 	if not is_refresh and styles.has("font-family") and styles["font-family"] not in ["sans-serif", "serif", "monospace"]:
 		var main_node = Engine.get_main_loop().current_scene
 		main_node.register_font_dependent_element(label, styles, element, parser)
-	
-	var text = text_override if text_override != "" else (element.get_preserved_text() if element.tag_name == "pre" else element.get_bbcode_formatted_text(parser))
 
 	var font_size = 24  # default
 
+	# Apply font family and weight (only if needed)
 	if styles.has("font-family"):
 		var font_family = styles["font-family"]
 		var font_resource = FontManager.get_font(font_family)
@@ -447,54 +465,19 @@ static func apply_styles_to_label(label: Control, styles: Dictionary, element: H
 			var default_font = FontManager.get_font("sans-serif")
 			apply_font_to_label(label, default_font, styles)
 	
-	# Apply font size
+	# Apply font size (only if different from default)
 	if styles.has("font-size"):
 		font_size = int(styles["font-size"])
-	
-	label.add_theme_font_size_override("normal_font_size", font_size)
-	label.add_theme_font_size_override("bold_font_size", font_size)
-	label.add_theme_font_size_override("italics_font_size", font_size)
-	label.add_theme_font_size_override("bold_italics_font_size", font_size)
-	label.add_theme_font_size_override("mono_font_size", font_size)
 		
-	var has_existing_bbcode = text.contains("[url=") or text.contains("[color=")
+		# Only update if different from current size to avoid unnecessary operations
+		if label.get_theme_font_size("normal_font_size") != font_size:
+			label.add_theme_font_size_override("normal_font_size", font_size)
+			label.add_theme_font_size_override("bold_font_size", font_size)
+			label.add_theme_font_size_override("italics_font_size", font_size)
+			label.add_theme_font_size_override("bold_italics_font_size", font_size)
+			label.add_theme_font_size_override("mono_font_size", font_size)
 	
-	# Apply color
-	var color_tag = ""
-	if not has_existing_bbcode and styles.has("color"):
-		var color = styles["color"] as Color
-		if color == Color.BLACK and StyleManager.body_text_color != Color.BLACK:
-			color = StyleManager.body_text_color
-		color_tag = "[color=#%s]" % color.to_html(false)
-	elif not has_existing_bbcode and StyleManager.body_text_color != Color.BLACK:
-		color_tag = "[color=#%s]" % StyleManager.body_text_color.to_html(false)
-
-	# Apply text styling (but not for text with existing BBCode)
-	var bold_open = ""
-	var bold_close = ""
-	if not has_existing_bbcode and styles.has("font-bold") and styles["font-bold"]:
-		bold_open = "[b]"
-		bold_close = "[/b]"
-	
-	var italic_open = ""
-	var italic_close = ""
-	if not has_existing_bbcode and styles.has("font-italic") and styles["font-italic"]:
-		italic_open = "[i]"
-		italic_close = "[/i]"
-	
-	var underline_open = ""
-	var underline_close = ""
-	if not has_existing_bbcode and styles.has("underline") and styles["underline"]:
-		underline_open = "[u]"
-		underline_close = "[/u]"
-	# Apply monospace font
-	var mono_open = ""
-	var mono_close = ""
-	if styles.has("font-mono") and styles["font-mono"]:
-		# If font-family is already monospace, just use BBCode for styling
-		if not (styles.has("font-family") and styles["font-family"] == "monospace"):
-			mono_open = "[code]"
-			mono_close = "[/code]"
+	# Apply text alignment (only if specified)
 	if styles.has("text-align"):
 		match styles["text-align"]:
 			"left":
@@ -505,22 +488,9 @@ static func apply_styles_to_label(label: Control, styles: Dictionary, element: H
 				label.horizontal_alignment = HORIZONTAL_ALIGNMENT_RIGHT
 			"justify":
 				label.horizontal_alignment = HORIZONTAL_ALIGNMENT_FILL
-	# Construct final text
 	
-	var styled_text = "%s%s%s%s%s%s%s%s%s%s%s" % [
-			color_tag,
-			bold_open,
-			italic_open,
-			underline_open,
-			mono_open,
-			text,
-			mono_close,
-			underline_close,
-			italic_close,
-			bold_close,
-			"[/color]" if color_tag.length() > 0 else "",
-	]
-		
+	# Use cached styled text generation
+	var styled_text = FontCache.get_cached_styled_text(element, styles, parser, text_override)
 	label.text = styled_text
 
 static func apply_body_styles(body: HTMLParser.HTMLElement, parser: HTMLParser, website_container: Control, website_background: Control) -> void:

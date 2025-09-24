@@ -106,17 +106,42 @@ func start_loading() -> void:
 	loading_tween = create_tween()
 	if loading_tween:
 		loading_tween.set_loops(0)
+		# Make loading animation faster and more responsive (0.6s instead of 1.0s)
 		loading_tween.tween_method(func(angle):
 			if !is_instance_valid(icon): 
 				if loading_tween: loading_tween.kill()
 				return
 			icon.rotation = angle
-		, 0.0, TAU, 1.0)
+		, 0.0, TAU, 0.6)
 
 func stop_loading() -> void:
 	if loading_tween:
 		loading_tween.kill()
 		loading_tween = null
+
+func update_loading_progress(stage: String) -> void:
+	"""Update the tab title to show current loading stage"""
+	if loading_tween and loading_tween.is_valid():
+		var progress_text = ""
+		match stage:
+			"connecting":
+				progress_text = "Connecting..."
+			"loading":
+				progress_text = "Loading..."
+			"parsing":
+				progress_text = "Parsing..."
+			"styling":
+				progress_text = "Styling..."
+			"rendering":
+				progress_text = "Rendering..."
+			"scripts":
+				progress_text = "Loading Scripts..."
+			"finalizing":
+				progress_text = "Finalizing..."
+			_:
+				progress_text = "Loading..."
+		
+		set_title(progress_text)
 
 func _exit_tree():
 	if loading_tween:

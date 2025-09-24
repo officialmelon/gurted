@@ -1,7 +1,14 @@
 class_name BackgroundUtils
 extends RefCounted
 
+# Import cache manager
+const StyleCache = preload("res://Scripts/Engine/StyleCacheManager.gd")
+
 static func create_stylebox_from_styles(styles: Dictionary = {}, container: Control = null) -> StyleBoxFlat:
+	# Use cached version for better performance
+	return StyleCache.get_cached_stylebox(styles, container)
+
+static func create_stylebox_from_styles_direct(styles: Dictionary = {}, container: Control = null) -> StyleBoxFlat:
 	var style_box = StyleBoxFlat.new()
 	
 	# Background color
