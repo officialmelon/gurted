@@ -32,6 +32,7 @@ jobs:
           cd tools/godot
           curl -L -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_macos.universal.zip"
           unzip -q godot.zip
+          ls -la godot
           # Find the Godot binary (works for both plain file and inside a folder)
           FOUND=$(find . -type f -name "Godot*" | head -n 1)
           if [ -z "$FOUND" ]; then
