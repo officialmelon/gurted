@@ -131,3 +131,143 @@ jobs:
             build/Flumi-Windows-x86_64.zip
           if-no-files-found: warn
           retention-days: 14
+
+  build-macos:
+    runs-on: macos-latest
+    
+    env:
+      GODOT_VERSION: "4.4"
+      EXPORT_DIR: "build"
+      MACOS_NAME: "Flumi-macOS-universal"
+
+    steps:
+      - name: Checkout (with LFS)
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Install Godot (headless) and templates
+        run: |
+          set -euxo pipefail
+          mkdir -p tools/godot
+          cd tools/godot
+          curl -L -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_macos.universal.zip"
+          unzip -q godot.zip
+          mv Godot_v4.4-stable_macos.universal Godot
+          chmod +x Godot
+          cd -
+          TEMPLATES_DIR="$HOME/Library/Application Support/Godot/export_templates/4.4.stable"
+          mkdir -p "${TEMPLATES_DIR}"
+          curl -L -o templates.tpz "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_export_templates.tpz"
+          unzip -q templates.tpz -d templates_unpacked
+          cp -R templates_unpacked/templates/* "${TEMPLATES_DIR}/"
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: x86_64-apple-darwin,aarch64-apple-darwin
+
+      - name: Compile GDExtension for Intel macOS
+        run: |
+          set -euxo pipefail
+          cd protocol/gdextension
+          chmod +x build.sh
+          ./build.sh --platform macos-intel --target release
+
+      - name: Compile GDExtension for ARM macOS
+        run: |
+          set -euxo pipefail
+          cd protocol/gdextension
+          ./build.sh --platform macos --target release
+
+      - name: Create Universal Binary
+        run: |
+          set -euxo pipefail
+          cd protocol/gdextension
+          mkdir -p addon/gurt-protocol/bin/macos
+          lipo -create -output addon/gurt-protocol/bin/macos/libgurt_godot.dylib \
+            target/x86_64-apple-darwin/release/libgurt_godot.dylib \
+            target/aarch64-apple-darwin/release/libgurt_godot.dylib
+          echo "Universal binary created:"
+          file addon/gurt-protocol/bin/macos/libgurt_godot.dylib
+
+      - name: Copy GDExtension addon to project
+        run: |
+          set -euxo pipefail
+          cd protocol/gdextension
+          cp -r addon/gurt-protocol ../../flumi/addons/
+
+      - name: Export macOS build
+        run: |
+          set -euxo pipefail
+          mkdir -p build
+          cd flumi
+          ../tools/godot/Godot --headless --path . --export-release "macOS" "../build/${MACOS_NAME}.app"
+          
+      - name: Check exported files
+        run: |
+          set -euxo pipefail
+          cd build
+          echo "Files in build directory:"
+          ls -la
+          echo "Files in .app bundle:"
+          ls -la "${MACOS_NAME}.app/Contents/MacOS/"
+          echo "Files in .app bundle Resources:"
+          ls -la "${MACOS_NAME}.app/Contents/Resources/" || echo "No Resources directory"
+
+      - name: Install create-dmg
+        run: |
+          set -euxo pipefail
+          brew install create-dmg
+
+      - name: Create macOS archive
+        run: |
+          set -euxo pipefail
+          cd build
+          zip -r "${MACOS_NAME}.zip" "${MACOS_NAME}.app"
+
+      - name: Create DMG installer
+        run: |
+          set -euxo pipefail
+          cd build
+          
+          # Create a temporary directory for DMG contents
+          mkdir -p dmg_contents
+          cp -R "Flumi-macOS-universal.app" dmg_contents/
+          
+          # Copy any additional files that might exist (like .pck files)
+          if [ -f "Flumi-macOS-universal.pck" ]; then
+            echo "Found .pck file, copying to app bundle"
+            cp "Flumi-macOS-universal.pck" "dmg_contents/Flumi-macOS-universal.app/Contents/Resources/"
+          fi
+          
+          # Copy any additional .dylib files that might exist
+          for dylib in *.dylib; do
+            if [ -f "$dylib" ]; then
+              echo "Found additional dylib: $dylib"
+              cp "$dylib" "dmg_contents/Flumi-macOS-universal.app/Contents/MacOS/"
+            fi
+          done
+          
+          create-dmg \
+            --volname "Flumi" \
+            --volicon "../flumi/Assets/gurted.ico" \
+            --window-pos 200 120 \
+            --window-size 600 300 \
+            --icon-size 100 \
+            --icon "Flumi-macOS-universal.app" 175 120 \
+            --hide-extension "Flumi-macOS-universal.app" \
+            --app-drop-link 425 120 \
+            "Flumi-macOS-universal.dmg" \
+            "dmg_contents/"
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: builds-macos-${{ github.sha }}
+          path: |
+            build/Flumi-macOS-universal.zip
+            build/Flumi-macOS-universal.dmg
+          if-no-files-found: warn
+          retention-days: 14
