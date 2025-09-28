@@ -25,21 +25,28 @@ jobs:
         with:
           lfs: true
 
-      - name: Install Godot (headless) and templates
-        run: |
-          set -euxo pipefail
-          mkdir -p tools/godot
-          cd tools/godot
-          curl -L -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_linux.x86_64.zip"
-          unzip -q godot.zip
-          mv Godot_v4.4-stable_linux.x86_64 Godot
-          chmod +x Godot
-          cd -
-          TEMPLATES_DIR="$HOME/.local/share/godot/export_templates/4.4.stable"
-          mkdir -p "${TEMPLATES_DIR}"
-          curl -L -o templates.tpz "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_export_templates.tpz"
-          unzip -q templates.tpz -d templates_unpacked
-          cp -R templates_unpacked/templates/* "${TEMPLATES_DIR}/"
+    - name: Install Godot (headless) and templates
+      run: |
+        set -euxo pipefail
+        mkdir -p tools/godot
+        cd tools/godot
+        curl -L -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_macos.universal.zip"
+        unzip -q godot.zip
+        # Find the Godot binary (works for both plain file and inside a folder)
+        FOUND=$(find . -type f -name "Godot*" | head -n 1)
+        if [ -z "$FOUND" ]; then
+          echo "Godot binary not found after unzip!"
+          exit 1
+        fi
+        mv "$FOUND" Godot
+        chmod +x Godot
+        cd -
+        TEMPLATES_DIR="$HOME/Library/Application Support/Godot/export_templates/4.4.stable"
+        mkdir -p "${TEMPLATES_DIR}"
+        curl -L -o templates.tpz "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_export_templates.tpz"
+        unzip -q templates.tpz -d templates_unpacked
+        cp -R templates_unpacked/templates/* "${TEMPLATES_DIR}/"
+
 
       - name: Export Linux build
         run: |
@@ -204,7 +211,7 @@ jobs:
           mkdir -p build
           cd flumi
           ../tools/godot/Godot --headless --path . --export-release "macOS" "../build/${MACOS_NAME}.app"
-          
+
       - name: Check exported files
         run: |
           set -euxo pipefail
@@ -221,6 +228,15 @@ jobs:
           set -euxo pipefail
           brew install create-dmg
 
+      - name: Convert ICO to ICNS
+        run: |
+          set -euxo pipefail
+          mkdir -p build/icon.iconset
+          sips -s format png ../flumi/Assets/gurted.ico --out build/icon.iconset/icon_512x512.png
+          iconutil -c icns build/icon.iconset -o build/gurted.icns
+          echo "Generated ICNS file:"
+          ls -lh build/gurted.icns
+
       - name: Create macOS archive
         run: |
           set -euxo pipefail
@@ -232,17 +248,14 @@ jobs:
           set -euxo pipefail
           cd build
           
-          # Create a temporary directory for DMG contents
           mkdir -p dmg_contents
           cp -R "Flumi-macOS-universal.app" dmg_contents/
           
-          # Copy any additional files that might exist (like .pck files)
           if [ -f "Flumi-macOS-universal.pck" ]; then
             echo "Found .pck file, copying to app bundle"
             cp "Flumi-macOS-universal.pck" "dmg_contents/Flumi-macOS-universal.app/Contents/Resources/"
           fi
           
-          # Copy any additional .dylib files that might exist
           for dylib in *.dylib; do
             if [ -f "$dylib" ]; then
               echo "Found additional dylib: $dylib"
@@ -252,7 +265,7 @@ jobs:
           
           create-dmg \
             --volname "Flumi" \
-            --volicon "../flumi/Assets/gurted.ico" \
+            --volicon "gurted.icns" \
             --window-pos 200 120 \
             --window-size 600 300 \
             --icon-size 100 \
