@@ -25,27 +25,27 @@ jobs:
         with:
           lfs: true
 
-    - name: Install Godot (headless) and templates
-      run: |
-        set -euxo pipefail
-        mkdir -p tools/godot
-        cd tools/godot
-        curl -L -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_macos.universal.zip"
-        unzip -q godot.zip
-        # Find the Godot binary (works for both plain file and inside a folder)
-        FOUND=$(find . -type f -name "Godot*" | head -n 1)
-        if [ -z "$FOUND" ]; then
-          echo "Godot binary not found after unzip!"
-          exit 1
-        fi
-        mv "$FOUND" Godot
-        chmod +x Godot
-        cd -
-        TEMPLATES_DIR="$HOME/Library/Application Support/Godot/export_templates/4.4.stable"
-        mkdir -p "${TEMPLATES_DIR}"
-        curl -L -o templates.tpz "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_export_templates.tpz"
-        unzip -q templates.tpz -d templates_unpacked
-        cp -R templates_unpacked/templates/* "${TEMPLATES_DIR}/"
+      - name: Install Godot (headless) and templates
+        run: |
+          set -euxo pipefail
+          mkdir -p tools/godot
+          cd tools/godot
+          curl -L -o godot.zip "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_macos.universal.zip"
+          unzip -q godot.zip
+          # Find the Godot binary (works for both plain file and inside a folder)
+          FOUND=$(find . -type f -name "Godot*" | head -n 1)
+          if [ -z "$FOUND" ]; then
+            echo "Godot binary not found after unzip!"
+            exit 1
+          fi
+          mv "$FOUND" Godot
+          chmod +x Godot
+          cd -
+          TEMPLATES_DIR="$HOME/Library/Application Support/Godot/export_templates/4.4.stable"
+          mkdir -p "${TEMPLATES_DIR}"
+          curl -L -o templates.tpz "https://github.com/godotengine/godot-builds/releases/download/4.4-stable/Godot_v4.4-stable_export_templates.tpz"
+          unzip -q templates.tpz -d templates_unpacked
+          cp -R templates_unpacked/templates/* "${TEMPLATES_DIR}/"
 
 
       - name: Export Linux build
